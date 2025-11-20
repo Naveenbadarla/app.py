@@ -2,11 +2,10 @@ import streamlit as st
 import pandas as pd
 
 
-# ---------- Core calculation logic ----------
+# ---------- Core calculation logic (single scenario) ----------
 
-def compute_scenarios(
+def compute_scenario(
     load_kwh: float,
-    load_kwh_2: float,
     pv_kwp: float,
     pv_yield_kwh_per_kwp: float,
     grid_price: float,
@@ -14,115 +13,107 @@ def compute_scenarios(
     batt_capacity_kwh: float,
     batt_efficiency: float,
     cycles_per_day: float,
-    sc_ratio_no_batt_1: float,
-    sc_ratio_no_batt_2: float,
+    sc_ratio_no_batt: float,
     da_spread: float,
     opt_capture: float,
     nonopt_capture: float,
 ) -> pd.DataFrame:
     """
-    Compute yearly energy flows and costs for:
+    Compute yearly energy flows and costs for one household load:
       - No battery
       - Battery, non-optimised
       - Battery, DA-optimised
-
-    for two different household loads.
     """
     pv_gen = pv_kwp * pv_yield_kwh_per_kwp
     results = []
 
-    def compute_for_load(load_kwh, sc_ratio_no_batt, label):
-        # --- No battery ---
-        # Direct PV self-consumption (simple assumption: fraction of load)
-        pv_sc_no_batt = min(load_kwh * sc_ratio_no_batt, pv_gen)
-        pv_export_no_batt = max(0.0, pv_gen - pv_sc_no_batt)
-        grid_import_no_batt = max(0.0, load_kwh - pv_sc_no_batt)
+    # --- No battery ---
+    # Direct PV self-consumption (simple assumption: fraction of load)
+    pv_sc_no_batt = min(load_kwh * sc_ratio_no_batt, pv_gen)
+    pv_export_no_batt = max(0.0, pv_gen - pv_sc_no_batt)
+    grid_import_no_batt = max(0.0, load_kwh - pv_sc_no_batt)
 
-        grid_cost_no_batt = grid_import_no_batt * grid_price
-        fit_rev_no_batt = pv_export_no_batt * fit_price
-        net_cost_no_batt = grid_cost_no_batt - fit_rev_no_batt
+    grid_cost_no_batt = grid_import_no_batt * grid_price
+    fit_rev_no_batt = pv_export_no_batt * fit_price
+    net_cost_no_batt = grid_cost_no_batt - fit_rev_no_batt
 
-        # --- Battery basics (unidirectional: only PV -> battery -> house) ---
-        batt_eff = batt_efficiency
-        batt_nominal_throughput = batt_capacity_kwh * batt_eff * cycles_per_day * 365.0
+    # --- Battery basics (unidirectional: only PV -> battery -> house) ---
+    batt_eff = batt_efficiency
+    batt_nominal_throughput = batt_capacity_kwh * batt_eff * cycles_per_day * 365.0
 
-        # Max extra self-consumption limited by remaining load
-        max_extra_sc = max(0.0, load_kwh - pv_sc_no_batt)
-        e_shift = min(batt_nominal_throughput, max_extra_sc)  # usable energy to load
-        pv_to_batt = e_shift / batt_eff if batt_eff > 0 else 0.0
+    # Max extra self-consumption limited by remaining load
+    max_extra_sc = max(0.0, load_kwh - pv_sc_no_batt)
+    e_shift = min(batt_nominal_throughput, max_extra_sc)  # usable energy to load
+    pv_to_batt = e_shift / batt_eff if batt_eff > 0 else 0.0
 
-        pv_sc_batt = pv_sc_no_batt + e_shift
-        pv_export_batt = max(0.0, pv_gen - pv_sc_no_batt - pv_to_batt)
-        grid_import_batt = max(0.0, load_kwh - pv_sc_batt)
+    pv_sc_batt = pv_sc_no_batt + e_shift
+    pv_export_batt = max(0.0, pv_gen - pv_sc_no_batt - pv_to_batt)
+    grid_import_batt = max(0.0, load_kwh - pv_sc_batt)
 
-        grid_cost_batt_base = grid_import_batt * grid_price
-        fit_rev_batt = pv_export_batt * fit_price
-        net_cost_batt_base = grid_cost_batt_base - fit_rev_batt
+    grid_cost_batt_base = grid_import_batt * grid_price
+    fit_rev_batt = pv_export_batt * fit_price
+    net_cost_batt_base = grid_cost_batt_base - fit_rev_batt
 
-        # --- DA arbitrage ---
-        # Simple assumption: arbitrage is only relevant if there is grid import
-        # without a battery (you can't arbitrage zero import).
-        arbitrage_energy = e_shift if grid_import_no_batt > 0 else 0.0
+    # --- DA arbitrage ---
+    # Simplified assumption: arbitrage is only relevant if there is grid import
+    # in the "no battery" case – otherwise there's nothing to shift on the tariff.
+    arbitrage_energy = e_shift if grid_import_no_batt > 0 else 0.0
 
-        spread_opt = da_spread * opt_capture
-        spread_non = da_spread * nonopt_capture
+    spread_opt = da_spread * opt_capture
+    spread_non = da_spread * nonopt_capture
 
-        arbitrage_non = arbitrage_energy * spread_non
-        arbitrage_opt = arbitrage_energy * spread_opt
+    arbitrage_non = arbitrage_energy * spread_non
+    arbitrage_opt = arbitrage_energy * spread_opt
 
-        net_cost_batt_nonopt = net_cost_batt_base - arbitrage_non
-        net_cost_batt_opt = net_cost_batt_base - arbitrage_opt
+    net_cost_batt_nonopt = net_cost_batt_base - arbitrage_non
+    net_cost_batt_opt = net_cost_batt_base - arbitrage_opt
 
-        # --- Collect rows ---
-        results.extend(
-            [
-                {
-                    "Scenario": label,
-                    "Configuration": "No battery",
-                    "Load (kWh/yr)": load_kwh,
-                    "PV generation (kWh/yr)": pv_gen,
-                    "Direct PV self-consumption (kWh/yr)": pv_sc_no_batt,
-                    "Battery -> load (kWh/yr)": 0.0,
-                    "PV export (kWh/yr)": pv_export_no_batt,
-                    "Grid import (kWh/yr)": grid_import_no_batt,
-                    "Grid cost (€)": grid_cost_no_batt,
-                    "EEG revenue (€)": fit_rev_no_batt,
-                    "DA arbitrage (€)": 0.0,
-                    "Net annual cost (€)": net_cost_no_batt,
-                },
-                {
-                    "Scenario": label,
-                    "Configuration": "Battery – non-optimised",
-                    "Load (kWh/yr)": load_kwh,
-                    "PV generation (kWh/yr)": pv_gen,
-                    "Direct PV self-consumption (kWh/yr)": pv_sc_no_batt,
-                    "Battery -> load (kWh/yr)": e_shift,
-                    "PV export (kWh/yr)": pv_export_batt,
-                    "Grid import (kWh/yr)": grid_import_batt,
-                    "Grid cost (€)": grid_cost_batt_base,
-                    "EEG revenue (€)": fit_rev_batt,
-                    "DA arbitrage (€)": arbitrage_non,
-                    "Net annual cost (€)": net_cost_batt_nonopt,
-                },
-                {
-                    "Scenario": label,
-                    "Configuration": "Battery – DA-optimised",
-                    "Load (kWh/yr)": load_kwh,
-                    "PV generation (kWh/yr)": pv_gen,
-                    "Direct PV self-consumption (kWh/yr)": pv_sc_no_batt,
-                    "Battery -> load (kWh/yr)": e_shift,
-                    "PV export (kWh/yr)": pv_export_batt,
-                    "Grid import (kWh/yr)": grid_import_batt,
-                    "Grid cost (€)": grid_cost_batt_base,
-                    "EEG revenue (€)": fit_rev_batt,
-                    "DA arbitrage (€)": arbitrage_opt,
-                    "Net annual cost (€)": net_cost_batt_opt,
-                },
-            ]
-        )
-
-    compute_for_load(load_kwh, sc_ratio_no_batt_1, "Scenario 1 (e.g. 3 MWh)")
-    compute_for_load(load_kwh_2, sc_ratio_no_batt_2, "Scenario 2 (e.g. 10 MWh)")
+    # --- Collect rows ---
+    results.append(
+        {
+            "Configuration": "No battery",
+            "Load (kWh/yr)": load_kwh,
+            "PV generation (kWh/yr)": pv_gen,
+            "Direct PV self-consumption (kWh/yr)": pv_sc_no_batt,
+            "Battery -> load (kWh/yr)": 0.0,
+            "PV export (kWh/yr)": pv_export_no_batt,
+            "Grid import (kWh/yr)": grid_import_no_batt,
+            "Grid cost (€)": grid_cost_no_batt,
+            "EEG revenue (€)": fit_rev_no_batt,
+            "DA arbitrage (€)": 0.0,
+            "Net annual cost (€)": net_cost_no_batt,
+        }
+    )
+    results.append(
+        {
+            "Configuration": "Battery – non-optimised",
+            "Load (kWh/yr)": load_kwh,
+            "PV generation (kWh/yr)": pv_gen,
+            "Direct PV self-consumption (kWh/yr)": pv_sc_no_batt,
+            "Battery -> load (kWh/yr)": e_shift,
+            "PV export (kWh/yr)": pv_export_batt,
+            "Grid import (kWh/yr)": grid_import_batt,
+            "Grid cost (€)": grid_cost_batt_base,
+            "EEG revenue (€)": fit_rev_batt,
+            "DA arbitrage (€)": arbitrage_non,
+            "Net annual cost (€)": net_cost_batt_nonopt,
+        }
+    )
+    results.append(
+        {
+            "Configuration": "Battery – DA-optimised",
+            "Load (kWh/yr)": load_kwh,
+            "PV generation (kWh/yr)": pv_gen,
+            "Direct PV self-consumption (kWh/yr)": pv_sc_no_batt,
+            "Battery -> load (kWh/yr)": e_shift,
+            "PV export (kWh/yr)": pv_export_batt,
+            "Grid import (kWh/yr)": grid_import_batt,
+            "Grid cost (€)": grid_cost_batt_base,
+            "EEG revenue (€)": fit_rev_batt,
+            "DA arbitrage (€)": arbitrage_opt,
+            "Net annual cost (€)": net_cost_batt_opt,
+        }
+    )
 
     df = pd.DataFrame(results)
     return df
@@ -137,37 +128,55 @@ def main():
     )
 
     st.title("PV + Battery + Day-Ahead Optimisation – Germany / EEG")
+
     st.markdown(
         """
-This app compares **annual energy flows and costs** for two household demand levels
-(e.g. 3,000 kWh and 10,000 kWh per year) with:
+This app shows **how much money a household can save per year** with:
 
-- Rooftop PV and EEG feed-in,
-- An optional **battery** that only supplies the house (no feed-in from the battery to the grid),
-- Two control strategies:
-  - **Non-optimised** (simple control),
-  - **Day-ahead (DA) optimised** control using price signals.
+- A PV system (with EEG feed-in),
+- A battery that only supplies the house (no battery → grid export),
+- And **smart vs simple** battery control using day-ahead prices.
 
-Use the **sidebar** to adjust all assumptions, and use the tabs below to:
-- See results,
-- Understand what each parameter means,
-- Read about the optimisation logic and the energy flow model.
+You can change the load, PV size and battery size and see immediately:
+**What changes in the bill?**
 """
     )
 
-    st.sidebar.header("Model assumptions")
+    # ---- Sidebar ----
+    st.sidebar.header("Model setup")
 
-    with st.sidebar.expander("ℹ️ Quick explanation", expanded=True):
-        st.write(
+    with st.sidebar.expander("💡 Quick explanation (read this first)", expanded=True):
+        st.markdown(
             """
-- **PV + EEG:** PV generation can be self-consumed or exported to the grid for a feed-in tariff (EEG).
-- **Battery (unidirectional):** The battery can be charged from PV and serve the house, but we assume it does **not** export to the grid.
-- **Optimisation:** Day-ahead optimisation tries to charge in cheaper hours and discharge in expensive hours (within the limits of your load and PV).
+Think of the energy flow like this:
+
+- ☀️ **PV** produces electricity.
+- 🏠 Your **home** uses some of it immediately (self-consumption).
+- 🔋 Your **battery** can store extra PV and use it later for the home.
+- 🔌 **Grid** delivers any remaining energy you still need,  
+  and buys your surplus PV via EEG.
+
+What the app compares:
+1. **No battery** → PV + grid only  
+2. **Battery – non-optimised** → battery increases self-consumption, but control is simple  
+3. **Battery – DA-optimised** → battery also tries to use **cheap hours to charge** and **expensive hours to discharge**, based on day-ahead prices
+
+The main question:
+> *How much extra does smart optimisation save on top of just having a battery?*
 """
         )
 
     # ---- Sidebar inputs ----
-    st.sidebar.subheader("PV system")
+    st.sidebar.subheader("Household & PV")
+
+    load_kwh = st.number_input(
+        "Household load (kWh/year)",
+        min_value=0.0,
+        value=3000.0,
+        step=500.0,
+        help="Total electricity use of the household per year.",
+    )
+
     col_pv1, col_pv2 = st.sidebar.columns(2)
     with col_pv1:
         pv_kwp = st.number_input(
@@ -175,7 +184,7 @@ Use the **sidebar** to adjust all assumptions, and use the tabs below to:
             min_value=0.0,
             value=9.5,
             step=0.1,
-            help="Installed peak power of the PV system. Higher kWp → more annual PV generation.",
+            help="Installed peak PV power. Higher = more PV generation.",
         )
     with col_pv2:
         pv_yield = st.number_input(
@@ -183,28 +192,25 @@ Use the **sidebar** to adjust all assumptions, and use the tabs below to:
             min_value=400.0,
             value=950.0,
             step=10.0,
-            help=(
-                "Annual specific yield per kWp. Depends on location, tilt, orientation etc. "
-                "Total PV generation = kWp × this value."
-            ),
+            help="Yearly PV output per kWp. Depends on location & orientation.",
         )
 
-    st.sidebar.subheader("Prices")
+    st.sidebar.subheader("Prices (Germany-style)")
     grid_price = st.number_input(
         "Grid price (€/kWh)",
         min_value=0.0,
         value=0.39,
         step=0.01,
         format="%.3f",
-        help="Retail electricity price you pay for each kWh imported from the grid.",
+        help="What you pay per kWh from the grid.",
     )
     fit_price = st.number_input(
-        "Feed-in tariff (€/kWh)",
+        "Feed-in tariff / EEG (€/kWh)",
         min_value=0.0,
         value=0.08,
         step=0.005,
         format="%.3f",
-        help="EEG remuneration for each kWh of PV exported to the grid.",
+        help="What you get per kWh when exporting PV to the grid.",
     )
 
     st.sidebar.subheader("Battery")
@@ -213,7 +219,7 @@ Use the **sidebar** to adjust all assumptions, and use the tabs below to:
         min_value=0.0,
         value=8.8,
         step=0.1,
-        help="Usable energy capacity of the battery. Higher capacity allows more shifting per day.",
+        help="Usable energy capacity of the battery.",
     )
     batt_efficiency = st.slider(
         "Round-trip efficiency (%)",
@@ -221,30 +227,24 @@ Use the **sidebar** to adjust all assumptions, and use the tabs below to:
         max_value=100,
         value=93,
         step=1,
-        help="Combined charge + discharge efficiency. 93% means that 1000 kWh in → 930 kWh out.",
+        help="Charge + discharge efficiency. 93% means 1000 kWh in → 930 kWh out.",
     ) / 100.0
     cycles_per_day = st.number_input(
         "Cycles per day",
         min_value=0.0,
         value=1.0,
         step=0.1,
-        help=(
-            "Average number of full cycles per day. 1 cycle/day means the battery charges and discharges "
-            "its full capacity once per day on average."
-        ),
+        help="How often, on average, the full battery capacity is cycled each day.",
     )
 
-    st.sidebar.subheader("Day-ahead (DA) market")
+    st.sidebar.subheader("Day-ahead (DA) market behaviour")
     da_spread = st.number_input(
         "Average DA daily spread (€/kWh)",
         min_value=0.0,
         value=0.112,
         step=0.01,
         format="%.3f",
-        help=(
-            "Typical difference between cheap and expensive hours in the day-ahead price. "
-            "Higher spread → more value from shifting energy between hours."
-        ),
+        help="Typical difference between cheap and expensive hours in DA prices.",
     )
     col_da1, col_da2 = st.sidebar.columns(2)
     with col_da1:
@@ -254,10 +254,7 @@ Use the **sidebar** to adjust all assumptions, and use the tabs below to:
             max_value=1.0,
             value=0.7,
             step=0.05,
-            help=(
-                "Fraction of the DA spread that the optimised control can actually capture. "
-                "1.0 = perfect arbitrage between cheapest and most expensive hours."
-            ),
+            help="How much of the DA spread smart control actually captures.",
         )
     with col_da2:
         nonopt_capture = st.slider(
@@ -266,59 +263,31 @@ Use the **sidebar** to adjust all assumptions, and use the tabs below to:
             max_value=1.0,
             value=0.35,
             step=0.05,
-            help=(
-                "Fraction of the DA spread captured by simple / non-optimised control. "
-                "Higher value means the baseline is already quite good."
-            ),
+            help="How much of the DA spread simple control captures by accident.",
         )
 
-    st.sidebar.subheader("Household loads & baseline self-consumption")
-    load1 = st.number_input(
-        "Scenario 1 load (kWh/yr)",
-        min_value=0.0,
-        value=3000.0,
-        step=500.0,
-        help="Annual electricity demand of household in Scenario 1 (e.g. small / low-usage home).",
-    )
-    load2 = st.number_input(
-        "Scenario 2 load (kWh/yr)",
-        min_value=0.0,
-        value=10000.0,
-        step=500.0,
-        help="Annual electricity demand of household in Scenario 2 (e.g. larger / high-usage home).",
-    )
-    sc_ratio1 = st.slider(
-        "Scenario 1 self-consumption (no battery)",
+    st.sidebar.subheader("Baseline self-consumption (no battery)")
+    sc_ratio = st.slider(
+        "Self-consumption ratio without battery",
         min_value=0.0,
         max_value=1.0,
         value=0.8,
         step=0.05,
         help=(
-            "Share of Scenario 1 load that is directly covered by PV without a battery. "
-            "High value means PV >> load and mid-day PV already meets most consumption."
-        ),
-    )
-    sc_ratio2 = st.slider(
-        "Scenario 2 self-consumption (no battery)",
-        min_value=0.0,
-        max_value=1.0,
-        value=0.3,
-        step=0.05,
-        help=(
-            "Share of Scenario 2 load that is directly covered by PV without a battery. "
-            "Lower value means more grid import and more potential benefit from a battery."
+            "Share of your load directly covered by PV without a battery. "
+            "High value = PV already covers a lot of your use at the right time."
         ),
     )
 
     st.sidebar.markdown("---")
     st.sidebar.caption(
-        "Tip: play with load, PV size, DA spread, and battery size to see when DA optimisation adds value."
+        "Tip: slide the **load** up and down. At low load and big PV, optimisation adds very little. "
+        "At high load and moderate PV, optimisation can add noticeable extra savings."
     )
 
-    # ---- Compute once ----
-    df = compute_scenarios(
-        load_kwh=load1,
-        load_kwh_2=load2,
+    # ---- Compute scenario ----
+    df = compute_scenario(
+        load_kwh=load_kwh,
         pv_kwp=pv_kwp,
         pv_yield_kwh_per_kwp=pv_yield,
         grid_price=grid_price,
@@ -326,228 +295,223 @@ Use the **sidebar** to adjust all assumptions, and use the tabs below to:
         batt_capacity_kwh=batt_capacity,
         batt_efficiency=batt_efficiency,
         cycles_per_day=cycles_per_day,
-        sc_ratio_no_batt_1=sc_ratio1,
-        sc_ratio_no_batt_2=sc_ratio2,
+        sc_ratio_no_batt=sc_ratio,
         da_spread=da_spread,
         opt_capture=opt_capture,
         nonopt_capture=nonopt_capture,
     )
 
-    # ---- Tabs ----
+    # Tabs
     tab_results, tab_params, tab_readme = st.tabs(
-        ["🧮 Results", "📊 Parameter definitions", "📘 Model & optimisation logic"]
+        ["🧮 Results", "📊 Parameter guide", "📘 Model & optimisation logic"]
     )
 
     # ========== TAB 1: RESULTS ==========
     with tab_results:
-        st.header("Results")
+        st.header("Results for this household")
 
-        display_cols = [
-            "Scenario",
-            "Configuration",
-            "Load (kWh/yr)",
-            "PV generation (kWh/yr)",
-            "Direct PV self-consumption (kWh/yr)",
-            "Battery -> load (kWh/yr)",
-            "PV export (kWh/yr)",
-            "Grid import (kWh/yr)",
-            "Grid cost (€)",
-            "EEG revenue (€)",
-            "DA arbitrage (€)",
-            "Net annual cost (€)",
-        ]
-        df_display = df[display_cols].copy()
-        numeric_cols = [
-            c for c in df_display.columns if c not in ["Scenario", "Configuration"]
-        ]
+        # Round for display
+        df_display = df.copy()
+        numeric_cols = [c for c in df_display.columns if c != "Configuration"]
         df_display[numeric_cols] = df_display[numeric_cols].round(2)
 
-        st.subheader("Detailed energy and cost table")
-        st.caption(
-            "Positive 'Net annual cost' means you pay money overall. "
-            "Negative values mean you earn more from EEG than you pay for grid import."
-        )
+        # Extract costs for metrics
+        costs = df.set_index("Configuration")["Net annual cost (€)"]
+        cost_no_batt = float(costs["No battery"])
+        cost_nonopt = float(costs["Battery – non-optimised"])
+        cost_opt = float(costs["Battery – DA-optimised"])
+
+        savings_nonopt = cost_no_batt - cost_nonopt
+        savings_opt = cost_no_batt - cost_opt
+        extra_opt = cost_nonopt - cost_opt
+
+        col_m1, col_m2, col_m3 = st.columns(3)
+        col_m1.metric("Net annual cost – No battery", f"{cost_no_batt:,.0f} €")
+        col_m2.metric("Net annual cost – Battery (non-optimised)", f"{cost_nonopt:,.0f} €",
+                      f"{savings_nonopt:,.0f} € vs no battery")
+        col_m3.metric("Net annual cost – Battery (DA-optimised)", f"{cost_opt:,.0f} €",
+                      f"{extra_opt:,.0f} € extra vs non-optimised")
+
+        st.subheader("Energy flow summary (per year)")
+        st.caption("All values are annual. PV → Battery → Home → Grid, under different controls.")
         st.dataframe(df_display, use_container_width=True)
 
-        # Pivot for charts
-        cost_summary = df.pivot(
-            index="Scenario", columns="Configuration", values="Net annual cost (€)"
-        )
-
-        st.subheader("Net annual cost by scenario and configuration")
-        st.dataframe(cost_summary.round(2))
-
-        # Calculate savings vs no battery within each scenario
-        summary_rows = []
-        for scenario in df["Scenario"].unique():
-            df_s = df[df["Scenario"] == scenario].set_index("Configuration")
-            cost_no_batt = df_s.loc["No battery", "Net annual cost (€)"]
-            cost_nonopt = df_s.loc["Battery – non-optimised", "Net annual cost (€)"]
-            cost_opt = df_s.loc["Battery – DA-optimised", "Net annual cost (€)"]
-
-            summary_rows.append(
-                {
-                    "Scenario": scenario,
-                    "No battery – net cost (€)": cost_no_batt,
-                    "Battery non-optimised – net cost (€)": cost_nonopt,
-                    "Battery DA-optimised – net cost (€)": cost_opt,
-                    "Savings vs no battery (non-optimised) (€)": cost_no_batt
-                    - cost_nonopt,
-                    "Savings vs no battery (DA-optimised) (€)": cost_no_batt
-                    - cost_opt,
-                    "Extra savings from optimisation (€)": cost_nonopt - cost_opt,
-                }
-            )
-
-        df_summary = pd.DataFrame(summary_rows)
-        df_summary_rounded = df_summary.copy()
-        for c in df_summary_rounded.columns:
-            if c != "Scenario":
-                df_summary_rounded[c] = df_summary_rounded[c].round(2)
-
-        st.subheader("Summary: savings from battery and optimisation")
-        st.dataframe(df_summary_rounded, use_container_width=True)
-
-        st.subheader("Net annual cost comparison (lower is better)")
+        st.subheader("Net annual cost per configuration (lower is better)")
+        cost_summary = df.set_index("Configuration")[["Net annual cost (€)"]]
         st.bar_chart(cost_summary)
 
-        with st.expander("How to read these results"):
+        with st.expander("📖 How to read these results (simple version)", expanded=True):
             st.markdown(
-                """
-- **Compare rows within the same Scenario:**
-  - *No battery* is your reference.
-  - *Battery – non-optimised* shows what happens if you only increase self-consumption with simple control.
-  - *Battery – DA-optimised* adds extra value from reacting to day-ahead price spreads.
-- **'Savings vs no battery'** shows how much better the battery configurations are compared to not having a battery.
-- **'Extra savings from optimisation'** is the incremental gain from smarter control, given that the battery is already installed.
+                f"""
+1. **Look at the three net annual costs at the top.**  
+   - *No battery* = your reference case.  
+   - *Battery – non-optimised* = same hardware, but simple control.  
+   - *Battery – DA-optimised* = same hardware, smarter control.
+
+2. **Battery vs. no battery**  
+   - The value **“X € vs no battery”** under *Battery – non-optimised* tells you:  
+     > “How much money does the battery save per year, **even without smart optimisation**?”
+
+3. **Extra value from optimisation**  
+   - The value **“extra vs non-optimised”** under *Battery – DA-optimised* tells you:  
+     > “If I already have a battery, how much more can I save by using smarter DA control?”
+
+4. **Sign of the numbers**  
+   - Positive net cost = you pay money overall.  
+   - Negative net cost = your EEG income is larger than your grid payments (you’re a net earner).
+
+5. **Play with the sliders**  
+   - Increase **load** → battery and optimisation usually become more valuable.  
+   - Increase **PV size** with small load → PV + battery can already cover almost everything, so DA optimisation adds very little.
 """
             )
 
-    # ========== TAB 2: PARAMETERS ==========
+        with st.expander("🔍 Visual mental model of the energy flow"):
+            st.markdown(
+                """
+**Think of three layers:**
+
+1. **Without battery**  
+   - Daytime: PV first covers your home, the rest goes to the grid (EEG).  
+   - Night: Everything comes from the grid.
+
+2. **With battery (non-optimised)**  
+   - Excess PV charges the battery instead of going straight to the grid.  
+   - Later (evening/night), the battery covers part of your load → less grid import.
+
+3. **With DA-optimised battery**  
+   - Same as above, **plus**:  
+     - The timing of charge/discharge follows **cheap vs expensive hours** as much as possible.  
+     - This squeezes a bit more value out of the same battery.
+"""
+            )
+
+    # ========== TAB 2: PARAMETER GUIDE ==========
     with tab_params:
-        st.header("Parameter definitions & impact")
+        st.header("Parameter guide – what each slider means")
 
         st.markdown(
             """
-### PV & prices
+### Household & PV
+
+- **Household load (kWh/year)**  
+  Total electricity use of the home.  
+  Higher load → more potential for the battery to do useful work.
 
 - **PV size (kWp)**  
-  Installed peak capacity of your PV system. Higher kWp → more annual PV generation.
+  Installed peak power of the PV system.  
+  More kWp → more PV production → more self-consumption but also more export.
 
 - **PV yield (kWh/kWp·year)**  
-  Annual production per kWp. Total PV generation = kWp × yield.  
-  Depends on location, tilt, orientation, shading.
+  Annual PV output per kWp.  
+  Total PV generation = *kWp × yield*.
+
+---
+
+### Prices
 
 - **Grid price (€/kWh)**  
-  What you pay per kWh imported from the grid.  
-  Higher grid price makes **self-consumption and the battery more valuable**.
+  What you pay for each kWh you buy from the grid.  
+  The higher this is, the more valuable self-consumption becomes.
 
-- **Feed-in tariff (€/kWh)**  
-  EEG remuneration for exporting PV to the grid.  
-  The value of self-consumption is roughly: `grid price − feed-in tariff`.
+- **Feed-in tariff / EEG (€/kWh)**  
+  What you earn for each kWh of PV exported to the grid.  
+  Roughly speaking, **value of self-consumption ≈ grid price − EEG price**.
 
 ---
 
 ### Battery
 
 - **Battery capacity (kWh)**  
-  Usable energy capacity. Larger batteries can shift more energy per day, up to the limit set by your load and PV.
+  How much energy the battery can store.  
+  Bigger battery → can shift more energy between times of day.
 
 - **Round-trip efficiency (%)**  
-  Fraction of energy that is recovered after charging and discharging.  
-  Example: 93% means 1000 kWh charged → 930 kWh discharged.  
-  Lower efficiency reduces the economic benefit of each shifted kWh.
+  Efficiency of charge + discharge.  
+  93% means: 1000 kWh into the battery → 930 kWh back out.  
+  Lower efficiency reduces the financial benefit per shifted kWh.
 
 - **Cycles per day**  
-  Average number of full cycles per day.  
-  1 cycle/day = charging from 0 → 100% and discharging back to 0% once per day on average.  
-  More cycles per day increase throughput and therefore potential arbitrage value.
+  How often the battery is fully charged and discharged per day on average.  
+  More cycles → more annual throughput → more potential savings (if the energy is actually useful).
 
 ---
 
-### DA (day-ahead) market
+### Day-ahead market
 
 - **Average DA daily spread (€/kWh)**  
-  Typical difference between cheap and expensive hours in the day-ahead market.  
-  Larger spread = more value from charging in cheap hours and discharging in expensive hours.
+  Typical price gap between cheapest and most expensive hours in a day.  
+  Bigger spread = more money to be made by shifting energy.
 
 - **Optimised capture fraction**  
-  How much of the DA spread a smart optimiser can capture.  
-  1.0 = perfect timing; 0.7 = captures 70% of the theoretical spread.
+  How much of that spread smart control can really capture (0–1).  
+  1.0 would be a perfect optimiser; 0.7 is realistic and still ambitious.
 
 - **Non-optimised capture fraction**  
-  How much of the DA spread a simple / rule-based controller captures accidentally.  
-  Higher value means the baseline is already good, so **the extra benefit of optimisation becomes smaller**.
+  How much of that spread a simple or dumb control captures “by accident”.  
+  If this is already high, extra value from optimisation will be small.
 
 ---
 
-### Loads & baseline self-consumption
-
-- **Scenario 1 / 2 load (kWh/yr)**  
-  Annual electricity demand of two different households, e.g.:
-  - Scenario 1: 3,000 kWh (small household),
-  - Scenario 2: 10,000 kWh (larger household).
+### Self-consumption ratio (no battery)
 
 - **Self-consumption ratio without battery**  
-  Fraction of the load that PV covers directly (without a battery).  
-  - High ratio → PV already meets a lot of consumption → less remaining potential for the battery.  
-  - Low ratio → more grid import → more potential benefit from adding a battery.
+  Approximate share of your load directly covered by PV in real time **without** a battery.  
+  - High value (e.g. 0.8 with small load & big PV) → battery has less to improve.  
+  - Lower value (e.g. 0.3 with big load & modest PV) → battery (and optimisation) can do more.
 """
         )
 
     # ========== TAB 3: MODEL & LOGIC ==========
     with tab_readme:
-        st.header("Model & optimisation logic (in-app README)")
+        st.header("Model & optimisation logic (README)")
 
         st.markdown(
             """
-### 1. High-level idea
+### 1. What the model does
 
-This tool compares three configurations for each scenario:
+For the chosen household and system, the app calculates – on a **yearly** basis:
 
-1. **No battery**  
-2. **Battery – non-optimised control**  
-3. **Battery – DA-optimised control**
+1. How much of the load is covered directly by PV.  
+2. How much PV is exported to the grid (EEG).  
+3. How much the battery can increase self-consumption.  
+4. How much additional value comes from reacting to **day-ahead prices**.
 
-All three share the same PV system and prices.  
-The battery is assumed to be **unidirectional** with respect to the grid:  
-it can charge from PV and supply the house, but **does not export energy into the grid**.
+It then converts all of this into **annual euros**:
+- Grid cost (what you pay),
+- EEG revenue (what you earn),
+- Net annual cost (grid cost – EEG revenue).
 
 ---
 
 ### 2. Energy flow assumptions
 
-For each scenario:
-
 1. **PV generation**  
-   - Annual PV generation = `PV size (kWp) × PV yield (kWh/kWp·year)`.
+   - Annual PV generation = `PV size × PV yield`.
 
-2. **No battery case**  
-   - We assume a fixed **self-consumption ratio without battery**.  
-   - Direct PV → load = `min(load × sc_ratio_no_batt, PV generation)`.  
-   - PV export = `PV generation − direct PV → load`.  
-   - Grid import = `load − direct PV → load`, limited to ≥ 0.
+2. **No battery**  
+   - A fixed share of the load is assumed to be directly covered by PV  
+     → `load × self-consumption ratio (no battery)`.  
+   - The rest of the load comes from the grid.  
+   - Any PV that isn’t used instantly is exported to the grid (EEG).
 
-3. **Battery case**  
-   - The battery can only increase **self-consumption**, i.e. take PV that would otherwise be exported and shift it to other hours where there is remaining load.
-   - Maximum **theoretical** usable battery throughput per year:  
-     `battery_capacity × efficiency × cycles_per_day × 365`.
-   - But the **actual** usable throughput is limited by the remaining load not already covered by direct PV:  
-     `max_extra_self_consumption = load − direct PV → load`  
-     `usable_throughput = min(theoretical_throughput, max_extra_self_consumption)`.
+3. **With battery**  
+   - The battery can only be charged from **PV** and only supplies the **house**.  
+     (No export from battery to grid – “unidirectional” battery.)  
+   - The maximum theoretical energy the battery can shift per year is:  
+     `capacity × efficiency × cycles_per_day × 365`.  
+   - But it is **limited** by how much load is left *after* direct PV self-consumption.  
+   - The model takes the minimum of those two values.
 
-   - The corresponding PV energy required to charge the battery is:  
-     `PV → battery = usable_throughput / efficiency`.
+4. **PV to battery**  
+   - To deliver `usable_throughput` to the house, the battery needs  
+     `PV → battery = usable_throughput / efficiency`.  
+   - That PV is taken away from export and turned into extra self-consumption.
 
-   - New self-consumption:  
-     `total PV self-consumption = direct PV → load + usable_throughput`.
-
-   - PV export shrinks by the PV that goes into the battery.  
-   - Grid import shrinks by the usable throughput (as long as there is remaining load).
-
-4. **Unidirectional constraint**  
-   - The model assumes **no battery → grid export**.  
-   - All exported energy is treated as coming directly from PV, which keeps EEG accounting simple.
+5. **New energy balances**  
+   - More PV is used in the home (via the battery).  
+   - Less PV is exported.  
+   - Less energy is imported from the grid.
 
 ---
 
@@ -555,70 +519,51 @@ For each scenario:
 
 For each configuration:
 
-- **Grid cost (€)**  
-  `grid_import × grid_price`.
+- **Grid cost (€)** = `grid_import × grid_price`  
+- **EEG revenue (€)** = `PV_export × feed-in tariff`  
+- **Net annual cost (€)** = `grid cost − EEG revenue`
 
-- **EEG revenue (€)**  
-  `PV_export × feed-in_tariff`.
-
-- **Net annual cost (€)**  
-  `grid cost − EEG revenue`.
-
-Positive values = you pay money overall.  
-Negative values = you earn more from EEG than you pay for grid import.
+A **negative** net annual cost means you earn more from feed-in than you pay for grid energy.
 
 ---
 
-### 4. Day-ahead optimisation logic
+### 4. Day-ahead optimisation
 
-We use a **simplified, annualised view** of DA optimisation:
+This is simplified but captures the key idea:
 
-1. **DA spread**  
-   - `da_spread` represents the typical difference between cheap and expensive hours (€/kWh).
+1. The **day-ahead spread** (€/kWh) says how big the price difference is between cheap and expensive hours on average.
 
-2. **Capture fractions**  
-   - Optimised control captures a fraction of this:  
-     `spread_opt = da_spread × opt_capture`.
-   - Non-optimised control captures a smaller fraction:  
-     `spread_non = da_spread × nonopt_capture`.
+2. Not all of that spread is usable in practice.  
+   - Smart control captures a share → `opt_capture`.  
+   - Simple control captures a smaller share → `nonopt_capture`.
 
-3. **Energy available for arbitrage**  
-   - We approximate that only the **battery throughput that replaces grid import** can be used for grid arbitrage.  
-   - If grid import without a battery is zero, arbitrage is set to zero (there is nothing to arbitrage).
+3. Only battery throughput that **replaces grid import** can be used for grid arbitrage.  
+   - If, without a battery, you already import almost nothing from the grid, there’s nothing to arbitrage.
 
-4. **Arbitrage value**  
-   - `arbitrage_non = arbitrage_energy × spread_non`.  
-   - `arbitrage_opt = arbitrage_energy × spread_opt`.
+4. Annual arbitrage value is then:  
+   - Non-optimised: `arbitrage_energy × (DA spread × nonopt_capture)`  
+   - Optimised: `arbitrage_energy × (DA spread × opt_capture)`
 
-5. **Net cost with arbitrage**  
-   - Base battery cost (self-consumption only): `net_cost_batt_base`.  
-   - Non-optimised: `net_cost_batt_nonopt = net_cost_batt_base − arbitrage_non`.  
-   - Optimised: `net_cost_batt_opt = net_cost_batt_base − arbitrage_opt`.
-
-The **extra value of optimisation** is simply the difference between these two battery cases.
+5. This arbitrage value is subtracted from the base battery net cost to get the final net cost for each control strategy.
 
 ---
 
-### 5. How to interpret the results
+### 5. How to use this tool in practice
 
-- The **main value** of the battery (especially in Germany with EEG) usually comes from:
-  - Increasing **self-consumption**, avoiding paying the grid price,
-  - Instead of exporting for a lower feed-in tariff.
+- Start with realistic **prices** and **PV size** for your country.  
+- Set your **annual load** and a plausible **self-consumption ratio without battery**.  
+- Then:
+  1. See if a **battery at all** makes economic sense compared to no battery.  
+  2. Look at the **extra** value from DA optimisation.  
+  3. Change load / PV / battery size to understand under which conditions optimisation becomes significant.
 
-- **Day-ahead optimisation** adds **extra value on top** of this by:
-  - Shifting battery charging/discharging within the day to exploit price spreads.
-
-- In **high-load scenarios** (e.g. 10,000 kWh/yr), the battery can typically cycle close to once per day and DA optimisation can have a noticeable impact.
-
-- In **low-load scenarios** with large PV (e.g. 3,000 kWh/yr and 9.5 kWp), PV + battery can already cover almost all load, so:
-  - Grid import becomes very small or zero,
-  - The potential for DA arbitrage is limited,
-  - The extra value of optimisation is much smaller.
-
-This README is intentionally high-level. You can use the parameter tab and the sidebar tooltips to explain the details to end-users and tweak the assumptions for your specific project or customer.
+This is a **planning / intuition tool**, not a detailed hourly simulation – but it gives a clear picture of:
+- Where the money comes from (self-consumption vs EEG),
+- And how much extra smart control can realistically add on top.
 """
         )
 
 
 if __name__ == "__main__":
     main()
+
